@@ -33,21 +33,15 @@ import pascal.taie.analysis.graph.cfg.CFGBuilder;
 import pascal.taie.analysis.graph.cfg.Edge;
 import pascal.taie.config.AnalysisConfig;
 import pascal.taie.ir.IR;
-import pascal.taie.ir.exp.ArithmeticExp;
-import pascal.taie.ir.exp.ArrayAccess;
-import pascal.taie.ir.exp.CastExp;
-import pascal.taie.ir.exp.FieldAccess;
-import pascal.taie.ir.exp.NewExp;
-import pascal.taie.ir.exp.RValue;
-import pascal.taie.ir.exp.Var;
+import pascal.taie.ir.exp.*;
 import pascal.taie.ir.stmt.AssignStmt;
 import pascal.taie.ir.stmt.If;
 import pascal.taie.ir.stmt.Stmt;
 import pascal.taie.ir.stmt.SwitchStmt;
+import pascal.taie.util.graph.AbstractEdge;
+import soot.toolkits.scalar.LiveLocals;
 
-import java.util.Comparator;
-import java.util.Set;
-import java.util.TreeSet;
+import java.util.*;
 
 public class DeadCodeDetection extends MethodAnalysis {
 
@@ -69,10 +63,103 @@ public class DeadCodeDetection extends MethodAnalysis {
                 ir.getResult(LiveVariableAnalysis.ID);
         // keep statements (dead code) sorted in the resulting set
         Set<Stmt> deadCode = new TreeSet<>(Comparator.comparing(Stmt::getIndex));
-        // TODO - finish me
+
+        Deque<Stmt> queue = new LinkedList<>();
+        Set<Stmt> reachableStmt = new HashSet<>();
+        Set<Stmt> seen = new HashSet<>();
+
+        queue.add(cfg.getEntry());
+        seen.add(cfg.getEntry());
+        while (!queue.isEmpty()) {
+            var stmt = queue.pollFirst();
+            seen.add(stmt);
+            if (stmt instanceof AssignStmt<?, ?> assignStmt) {
+                var lValue = assignStmt.getLValue();
+                reachableStmt.add(stmt);
+                if (lValue instanceof Var def) {
+                    var noSideEffect = hasNoSideEffect(assignStmt.getRValue());
+                    var noUse = !liveVars.getResult(stmt).contains(def);
+                    if (noSideEffect && noUse) {
+                        reachableStmt.remove(stmt);
+                    }
+                }
+                for (var succ : cfg.getSuccsOf(stmt)) {
+                    if (!seen.contains(succ)) {
+                        queue.add(succ);
+                    }
+                }
+            } else if (stmt instanceof If ifStmt) {
+                reachableStmt.add(stmt);
+                var stmtLiveVar = constants.getResult(stmt);
+                var cond = ifStmt.getCondition();
+                var eval = handleConditionExp(cond, stmtLiveVar);
+                if (eval.isConstant()) {
+                    if (eval.getConstant() == 1) {
+                        for (var edge : cfg.getOutEdgesOf(stmt)) {
+                            if (edge.getKind() == Edge.Kind.IF_TRUE) {
+                                queue.add(edge.getTarget());
+                            }
+                        }
+                    } else {
+                        for (var edge : cfg.getOutEdgesOf(stmt)) {
+                            if (edge.getKind() == Edge.Kind.IF_FALSE) {
+                                queue.add(edge.getTarget());
+                            }
+                        }
+                    }
+                } else {
+                    for (var succ : cfg.getSuccsOf(stmt)) {
+                        if (!seen.contains(succ)) {
+                            queue.add(succ);
+                        }
+                    }
+                }
+            } else if (stmt instanceof SwitchStmt switchStmt) {
+                var stmtLiveVar = constants.getResult(stmt);
+                var value = stmtLiveVar.get(switchStmt.getVar());
+                reachableStmt.add(stmt);
+                if (value.isConstant()) {
+                    int constant = value.getConstant();
+                    boolean match = false;
+                    for (Edge<Stmt> edge : cfg.getOutEdgesOf(switchStmt)) {
+                        if (edge.getKind() == Edge.Kind.SWITCH_CASE) {
+                            int caseValue = edge.getCaseValue();
+                            if (caseValue == constant) {
+                                match = true;
+                                if (!seen.contains(edge.getTarget()))
+                                    queue.addLast(edge.getTarget());
+                            }
+                        }
+                    }
+                    if (!match) {
+                        Stmt defaultTarget = switchStmt.getDefaultTarget();  // 获取default对应的目标语句
+                        if (!seen.contains(defaultTarget))
+                            queue.addLast(defaultTarget);
+                    }
+                } else {
+                    for (Stmt succ : cfg.getSuccsOf(switchStmt)) {
+                        if (!seen.contains(succ))
+                            queue.addLast(succ);
+                    }
+                }
+            } else {
+                reachableStmt.add(stmt);
+                for (Stmt succ : cfg.getSuccsOf(stmt)) {
+                    if (!seen.contains(succ))
+                        queue.addLast(succ);
+                }
+            }
+        }
+
+        for (Stmt stmt : ir.getStmts()) {
+            if (!reachableStmt.contains(stmt)) {
+                deadCode.add(stmt);
+            }
+        }
         // Your task is to recognize dead code in ir and add it to deadCode
         return deadCode;
     }
+
 
     /**
      * @return true if given RValue has no side effect, otherwise false.
@@ -95,5 +182,57 @@ public class DeadCodeDetection extends MethodAnalysis {
             return op != ArithmeticExp.Op.DIV && op != ArithmeticExp.Op.REM;
         }
         return true;
+    }
+
+    private static Value evaluate(Exp exp, CPFact in) {
+        if (exp instanceof Var var) {
+            return in.get(var);
+        }
+        if (exp instanceof IntLiteral intLiteral) {
+            return Value.makeConstant(intLiteral.getValue());
+        }
+        if (exp instanceof ConditionExp conditionExp) {
+            return handleConditionExp(conditionExp, in);
+        }
+        return Value.getNAC();
+    }
+
+    private static Value handleConditionExp(ConditionExp conditionExp, CPFact in) {
+        var a = evaluate(conditionExp.getOperand1(), in);
+        var b = evaluate(conditionExp.getOperand2(), in);
+        if (a.isUndef() || b.isUndef()) {
+            return Value.getUndef();
+        }
+        if (conditionExp.getOperator().equals(ConditionExp.Op.EQ)) {
+            if (a.isConstant() && b.isConstant()) {
+                return a.getConstant() == b.getConstant() ? Value.makeConstant(1) : Value.makeConstant(0);
+            }
+        }
+        if (conditionExp.getOperator().equals(ConditionExp.Op.NE)) {
+            if (a.isConstant() && b.isConstant()) {
+                return a.getConstant() != b.getConstant() ? Value.makeConstant(1) : Value.makeConstant(0);
+            }
+        }
+        if (conditionExp.getOperator().equals(ConditionExp.Op.LT)) {
+            if (a.isConstant() && b.isConstant()) {
+                return a.getConstant() < b.getConstant() ? Value.makeConstant(1) : Value.makeConstant(0);
+            }
+        }
+        if (conditionExp.getOperator().equals(ConditionExp.Op.GT)) {
+            if (a.isConstant() && b.isConstant()) {
+                return a.getConstant() > b.getConstant() ? Value.makeConstant(1) : Value.makeConstant(0);
+            }
+        }
+        if (conditionExp.getOperator().equals(ConditionExp.Op.LE)) {
+            if (a.isConstant() && b.isConstant()) {
+                return a.getConstant() <= b.getConstant() ? Value.makeConstant(1) : Value.makeConstant(0);
+            }
+        }
+        if (conditionExp.getOperator().equals(ConditionExp.Op.GE)) {
+            if (a.isConstant() && b.isConstant()) {
+                return a.getConstant() >= b.getConstant() ? Value.makeConstant(1) : Value.makeConstant(0);
+            }
+        }
+        return Value.getNAC();
     }
 }
