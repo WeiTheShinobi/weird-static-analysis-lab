@@ -26,8 +26,7 @@ import pascal.taie.analysis.dataflow.fact.DataflowResult;
 import pascal.taie.analysis.graph.icfg.ICFG;
 import pascal.taie.util.collection.SetQueue;
 
-import java.util.Queue;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 
 /**
@@ -59,10 +58,31 @@ class InterSolver<Method, Node, Fact> {
     }
 
     private void initialize() {
-        // TODO - finish me
+        for (var node : icfg) {
+            result.setInFact(node, analysis.newInitialFact());
+            result.setOutFact(node, analysis.newInitialFact());
+        }
+        icfg.entryMethods().forEach(method -> {
+            var entryOf = icfg.getEntryOf(method);
+            result.setOutFact(entryOf, analysis.newBoundaryFact(entryOf));
+            result.setInFact(entryOf, analysis.newBoundaryFact(entryOf));
+        });
     }
 
     private void doSolve() {
-        // TODO - finish me
+        workList = new ArrayDeque<>();
+        for (var node : icfg) {
+            workList.add(node);
+        }
+        while (!workList.isEmpty()) {
+            var node = workList.poll();
+            for (var edge : icfg.getInEdgesOf(node)) {
+                var outFact = analysis.transferEdge(edge, result.getOutFact(edge.getSource()));
+                analysis.meetInto(outFact, result.getInFact(node));
+            }
+            if (analysis.transferNode(node, result.getInFact(node), result.getOutFact(node))) {
+                workList.addAll(icfg.getSuccsOf(node));
+            }
+        }
     }
 }

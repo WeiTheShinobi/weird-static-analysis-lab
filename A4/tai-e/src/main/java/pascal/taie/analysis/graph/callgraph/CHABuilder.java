@@ -30,9 +30,7 @@ import pascal.taie.language.classes.JClass;
 import pascal.taie.language.classes.JMethod;
 import pascal.taie.language.classes.Subsignature;
 
-import java.util.ArrayDeque;
-import java.util.Queue;
-import java.util.Set;
+import java.util.*;
 
 /**
  * Implementation of the CHA algorithm.
@@ -49,8 +47,26 @@ class CHABuilder implements CGBuilder<Invoke, JMethod> {
 
     private CallGraph<Invoke, JMethod> buildCallGraph(JMethod entry) {
         DefaultCallGraph callGraph = new DefaultCallGraph();
+        Deque<JMethod> queue = new LinkedList<>();
+
+        queue.add(entry);
         callGraph.addEntryMethod(entry);
-        // TODO - finish me
+        while (!queue.isEmpty()) {
+            var method = queue.pollFirst();
+            if (callGraph.contains(method)) {
+                continue;
+            }
+            callGraph.addReachableMethod(method);
+            var invokeStream = callGraph.callSitesIn(method);
+            invokeStream.forEach(cs -> {
+                for (JMethod targetMethod : resolve(cs)) {
+                    if (targetMethod != null) {
+                        callGraph.addEdge(new Edge<>(CallGraphs.getCallKind(cs), cs, targetMethod));
+                        queue.addLast(targetMethod);
+                    }
+                }
+            });
+        }
         return callGraph;
     }
 
@@ -58,8 +74,45 @@ class CHABuilder implements CGBuilder<Invoke, JMethod> {
      * Resolves call targets (callees) of a call site via CHA.
      */
     private Set<JMethod> resolve(Invoke callSite) {
-        // TODO - finish me
-        return null;
+        var result = new HashSet<JMethod>();
+        var methodRef = callSite.getMethodRef();
+        var declareClass = methodRef.getDeclaringClass();
+        var kind = CallGraphs.getCallKind(callSite);
+
+        switch (kind) {
+            case STATIC -> result.add(declareClass.getDeclaredMethod(methodRef.getSubsignature()));
+            case SPECIAL -> result.add(dispatch(declareClass, methodRef.getSubsignature()));
+            case VIRTUAL, INTERFACE -> {
+                ArrayDeque<JClass> subclasses = new ArrayDeque<>();
+                HashSet<JClass> set = new HashSet<>();
+                subclasses.addLast(declareClass);
+                set.add(declareClass);
+                while (!subclasses.isEmpty()) {
+                    JClass subclass = subclasses.pollFirst();
+                    result.add(dispatch(subclass, methodRef.getSubsignature()));
+                    for (JClass jClass : (hierarchy.getDirectSubclassesOf(subclass))) {
+                        if (!set.contains(jClass)) {
+                            set.add(jClass);
+                            subclasses.addLast(jClass);
+                        }
+                    }
+                    for (JClass jClass : (hierarchy.getDirectSubinterfacesOf(subclass))) {
+                        if (!set.contains(jClass)) {
+                            set.add(jClass);
+                            subclasses.addLast(jClass);
+                        }
+                    }
+                    for (JClass jClass : (hierarchy.getDirectImplementorsOf(subclass))) {
+                        if (!set.contains(jClass)) {
+                            set.add(jClass);
+                            subclasses.addLast(jClass);
+                        }
+                    }
+                }
+            }
+        }
+
+        return result;
     }
 
     /**
@@ -69,7 +122,12 @@ class CHABuilder implements CGBuilder<Invoke, JMethod> {
      * can be found.
      */
     private JMethod dispatch(JClass jclass, Subsignature subsignature) {
-        // TODO - finish me
-        return null;
+        if (jclass == null) {
+            return null;
+        }
+        if (jclass.getDeclaredMethod(subsignature) != null && !jclass.getDeclaredMethod(subsignature).isAbstract()) {
+            return jclass.getDeclaredMethod(subsignature);
+        }
+        return dispatch(jclass.getSuperClass(), subsignature);
     }
 }
